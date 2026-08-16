@@ -3,9 +3,31 @@
 面向 DeepSeek Harness（DSH）的 gh CLI 集成插件：环境检测与自愈、多账户认证管理、
 Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → GitHub CLI）呈现。
 
-本插件是**动态 Cordis Plugin**（`ghcli-1`），运行时代码即本目录 `src/host.js` 与
-`src/client.js`，无需编译、无需重启 DSH；在会话内定义并激活后即挂载，
-停止（`cordis_stop`）或删除（`cordis_undefine`）即整体卸载。
+本插件是**标准 DSH 插件包**（npm 包形态）：host 半区（`src/host.js`，即 package.json
+`main`）运行在宿主进程，注册 `/api/dsh-ghcli/*` 路由并执行 gh/git；client 半区
+（`src/client.js`，即 `exports["./client"]`）以 module-loader 束加载进 Web GUI，
+注册 `settings.section` 插槽。无需编译、无需改 DSH 源码；随 profile 常驻，
+DSH 重启后自动加载。早期动态 Cordis 插件（`ghcli-1`，会话内 `cordis_define`）
+形态已归档，代码不再兼容动态挂载。
+
+---
+
+## 0. 安装（常驻模式）
+
+```powershell
+dsh plugin --profile web add D:\Program\harness\plugins\dsh-ghCLI -w
+```
+
+- `-w` 必须：web profile 目录本身是 pnpm workspace root（`pnpm-workspace.yaml`
+  的 `packages: [.]`），不加会报 `ERR_PNPM_ADDING_TO_ROOT`。
+- 若报 `ERR_PNPM_UNEXPECTED_STORE`（store 布局版本不符），把全局 pnpm 升到 v10
+  再重跑。
+- 装完验证 `~/.dsh/profiles/web/package.json` 出现 `dsh-ghcli` 依赖与
+  `dsh.profile.bundles` 条目、`node_modules/dsh-ghcli` 存在、`pnpm-lock.yaml`
+  含该包；然后**重启 dsh web**（client 插件集合变更需重启生效），刷新页面后
+  在 设置 → GitHub CLI 查看。
+- 卸载：`dsh plugin --profile web remove dsh-ghcli`。本地 file: 依赖通常为
+  符号链接，改 `src/` 后重启 dsh web 即生效。
 
 ---
 
@@ -19,18 +41,19 @@ Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → 
 
 ## 2. 架构（模块清单）
 
-动态插件把目标功能映射到两份运行时源码（`code.host` / `code.client`），
-内部按同名模块组织（设计来源为开发初期的 readme.txt，该文件已归档移除）：
+插件包把目标功能映射到两份运行时源码（host 半区 `main` / client 半区
+`exports["./client"]`），内部按同名模块组织（设计来源为开发初期的 readme.txt，
+该文件已归档移除）：
 
-| readme 文件 | 动态插件中的对应物 |
+| readme 文件 | 标准插件包中的对应物 |
 | --- | --- |
 | `src/host/gh-executor.ts` | `src/host.js` → `runArgv` / `readAll` / `resolveExe` |
 | `src/host/gh-detector.ts` | `src/host.js` → `ensureEnv` / `detectGh` / `detectInstallers` / `installGh` |
 | `src/host/gh-auth-manager.ts` | `src/host.js` → `authStatus` / `authLogin` / `authSwitch` / `authLogout` / `authRefresh` |
 | `src/host/git-manager.ts` | `src/host.js` → `repoCurrent` / `repoClone` / `repoStatus` / `repoFork` / `repoCreate` / `repoOpenRemote` / `repoPush` / `repoPull` / `repoPrCreate` |
-| `src/host/routes.ts` | `src/host.js` → 底部 `harness.handle('gh.*')` RPC 注册 |
+| `src/host/routes.ts` | `src/host.js` → 底部 `routes` 数组，经 `ctx.webServer.register` 注册的 `/api/dsh-ghcli/*` JSON 路由 |
 | `src/client/index.tsx` + components | `src/client.js` → `GhSettings` / `StatusTab` / `AccountTab` / `RepoTab`，注册进 `settings.section` 插槽 |
-| `src/client/styles.css` | `src/client.js` → `styles.insert(...)`（使用 `--dsw-alias-*` 主题变量，自适应暗色） |
+| `src/client/styles.css` | `src/client.js` → `insertStyles(...)`（`data-plugin-css` 样式标签，使用 `--dsw-alias-*` 主题变量，自适应暗色） |
 
 ## 3. 关键实现约束（落地情况）
 
@@ -62,7 +85,10 @@ Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → 
   `canCreatePr = hasUpstream && ahead > 0`（`git rev-list --left-right --count @{u}...HEAD`），
   客户端据此禁用/启用按钮并给 title 提示。
 
-## 5. Client ↔ Host RPC 一览（harness.handle / host.call）
+## 5. Client ↔ Host RPC 一览（/api/dsh-ghcli/* JSON 路由）
+
+client 半区用同源 `fetch` POST 到 `/api/dsh-ghcli/<方法名>`（`jsonRoute` 生成，
+带 loopback + 同源防护）；方法名与响应契约沿用早期动态版的 `harness.handle`：
 
 `gh.status` · `gh.install` · `gh.setPath`（手动指定 gh 路径） · `gh.addPath`（加入 PATH） ·
 `gh.net.status` · `gh.net.set` · `gh.net.auto`（自动使用系统代理） · `gh.net.clear` · `gh.net.test` ·
