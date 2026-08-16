@@ -48,7 +48,7 @@ dsh plugin --profile web add @sweven-tears/dsh-ghcli -w
 
 | Tab | 能力 | 底层命令 |
 | --- | --- | --- |
-| 📦 状态与安装 | gh 安装徽章（✅ 已安装 v2.x / ❌ 未安装）、重新检测、一键安装/更新、GH_HOST 展示、未安装引导 Banner（自动安装 / 手动指引）、**手动指定 gh 安装路径**、**一键加入 PATH**、**网络代理自愈**（检测系统代理并写入 git 配置 / 测试连接） | `gh --version`、`gh config get host`、winget/brew/apt、`reg add HKCU\Environment\Path` / `~/.bashrc`、`git config http.proxy` |
+| 📦 状态与安装 | gh 安装徽章（✅ 已安装 v2.x / ❌ 未安装）、重新检测、一键安装/更新、GH_HOST 展示、未安装引导 Banner（自动安装 / 手动指引）、**手动指定 gh 安装路径**、**一键加入 PATH**、**git 安装路径展示**（`gitBin`，同款三级兜底）、**网络代理自愈**（检测系统代理并写入 git 配置 / 测试连接） | `gh --version`、`gh config get host`、winget/brew/apt、`reg add HKCU\Environment\Path` / `~/.bashrc`、`git config http.proxy` |
 | 🔐 账户与 Git | 活跃账户头像+用户名、账户列表（切换/登出）、Token 粘贴登录（企业版 GH_HOST）、刷新 Token、Git 全局 user.name/user.email 读写 | `gh auth status`、`gh api user`、`gh auth login --with-token`、`gh auth switch --user`、`gh auth logout`、`gh auth refresh`、`git config --global` |
 | 📁 仓库管理 | 克隆（目标非空弹确认框、浅克隆）、当前工作区仓库分支/未提交数/upstream 差异、Push/Pull/Create PR/打开远程页面、远程仓库 Star/Fork/最后推送、Fork、创建仓库 | `gh repo clone`、`gh api repos/{owner}/{repo}`、`gh repo fork`、`gh repo create`、`git push/pull/status/remote`、`gh pr create` |
 
@@ -67,7 +67,10 @@ dsh plugin --profile web add @sweven-tears/dsh-ghcli -w
 ### 实现要点
 
 - **依赖最小化**：不安装任何 npm 包（无 simple-git）。Git 操作优先 `gh` CLI，本地仓库操作（状态/分支/upstream 差异/Push/Pull）直接调用系统 `git` 作为 fallback。
-- **执行通道**：Host 侧使用 `ctx.subprocess.spawn`（显式 argv，无 shell 注入面）；所有 gh/git 调用统一走 `runArgv`，每个调用都记录日志。
+- **绝对路径执行**：所有 `gh` / `git` 命令都使用解析到的**绝对路径**（`gh.exe` / `git.exe`）执行，而非依赖 PATH 中的裸命令名。解析按「进程 PATH → 注册表用户+系统 PATH（Windows）→ 常见安装目录」三级兜底，任一级命中即缓存该绝对路径（`gh.status` 返回 `path` / `gitBin` 供界面展示）。只有完全找不到可执行文件时才回退到 PATH 裸命令，保证命令一定能执行。
+- **宿主 PATH 快照陈旧兜底**：DSH 宿主进程启动时会把 PATH 快照进自身进程环境，之后 `setx` 新增的环境变量不会反映到已运行的宿主进程。为绕开这一点，gh 与 git 均内置「注册表 PATH（Windows，无需重启 DSH）+ 常见安装目录」兜底，新加环境变量 / 新装 Git 无需重启即可识别。
+- **零额外 Token 消耗**：绝对路径解析在插件生命周期内**只做一次**（`ghBinInit` / `gitBinInit` 三态缓存），之后所有命令直接从内存 argv 复用，**不反复探测 PATH、不启动探测子进程**。仅当用户主动点「重新检测」时才清缓存重探，成本可预期。
+- **执行通道**：Host 侧使用 `ctx.subprocess.spawn`（显式 argv，无 shell 注入面）；所有 gh/git 调用统一走 `runArgv` / `runGit`，每个调用都记录日志。
 - **超时与取消**：`runArgv` 默认 30s；`gh repo clone` / `install` / `create` / `fork` 等长命令 300s（5 分钟），超时后终止进程树；客户端长操作显示「取消」按钮。
 - **安全**：克隆非空目录必须先确认，确认后**重命名备份**原目录再克隆，绝不强制覆盖/删除；切换账户立即生效（每次调用全新 gh 进程），无需重启 DSH。
 

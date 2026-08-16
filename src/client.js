@@ -256,6 +256,7 @@ window.__ModuleLoader__.load({
               h('button', { className: 'ghcli-btn', disabled: !!p.busy || !manualPath.trim(), onClick: async () => { const r = await p.call('gh.addPath', { dir: manualPath.trim() }); if (r && r.ok) p.refresh() } }, addPathLabel),
             ),
             h('div', { className: 'ghcli-hint' }, 'gh 已安装但检测不到时（不在 PATH）：在此指定其安装目录即可立即使用；「' + addPathLabel + '」可把它加入环境变量 PATH（可选，重启 DSH / 新终端后全局生效）。'),
+            h('div', { className: 'ghcli-hint' }, 'git 安装路径：' + (st.gitBin ? st.gitBin : '未找到（命令将回退到 PATH 中的 git）') + (st.gitPathSource === 'known' ? '（经常见目录探测到）' : '')),
           ) : null,
 
           st ? h('div', { className: 'ghcli-card' },

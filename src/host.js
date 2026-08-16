@@ -35,6 +35,9 @@ export function apply(ctx) {
     ghBinInit: false,     // ghBin 是否已解析（三态避免重复探测）
     pathSource: null,     // ghBin 来源：'path' | 'manual' | 'registry' | 'known' | null
     manualPath: null,     // 用户手动指定的 gh 路径（exe 或目录）
+    gitBin: null,         // 解析到的 git 可执行文件绝对路径（git.exe / git）；null 表示未找到
+    gitBinInit: false,    // gitBin 是否已解析（三态避免重复探测）
+    gitPathSource: null,  // gitBin 来源：'path' | 'registry' | 'known' | null
     activeOps: new Map(), // opId -> { terminate, label }
     opSeq: 0,
   }
@@ -288,6 +291,90 @@ export function apply(ctx) {
     return state.ghBin ? [state.ghBin].concat(args) : ['gh'].concat(args)
   }
 
+  // ================= git 可执行文件解析（与 gh 同款三级兜底） =================
+  // 常见 git 安装目录探测（PATH 与注册表都失败时的最后兜底）
+  async function probeKnownGitLocations() {
+    await ensureEnv()
+    const env = state.env
+    const locs = []
+    if (env.platform === 'windows') {
+      if (env.localAppData) {
+        locs.push(
+          joinPath(env.localAppData, 'Programs', 'Git', 'cmd', 'git.exe'),
+          joinPath(env.localAppData, 'Programs', 'Git', 'bin', 'git.exe'),
+          joinPath(env.localAppData, 'GitHubDesktop', 'bin', 'git.exe'),
+        )
+      }
+      if (env.home) locs.push(joinPath(env.home, 'scoop', 'shims', 'git.exe'))
+      locs.push(
+        joinPath('C:', 'Program Files', 'Git', 'cmd', 'git.exe'),
+        joinPath('C:', 'Program Files', 'Git', 'bin', 'git.exe'),
+        joinPath('C:', 'Program Files (x86)', 'Git', 'cmd', 'git.exe'),
+        joinPath('C:', 'Program Files', 'GitHub Desktop', 'bin', 'git.exe'),
+      )
+    } else {
+      locs.push('/usr/bin/git', '/usr/local/bin/git', '/opt/homebrew/bin/git', '/snap/bin/git')
+      if (env.home) locs.push(joinPath(env.home, '.local', 'bin', 'git'))
+    }
+    for (const loc of locs) {
+      if (!loc) continue
+      const r = await resolveExe(loc)
+      if (r) return r
+    }
+    return null
+  }
+
+  // git 可执行文件解析（三级兜底，同 ensureGhBin）：
+  //   1) 进程 PATH
+  //   2) 注册表里的用户 + 系统 PATH（Windows 专用，无需重启 DSH）
+  //   3) 常见安装目录探测（Git for Windows / GitHub Desktop / scoop 等）
+  let gitBinInflight = null // 并发调用去重：repoCurrent 等 Promise.all 场景只探测一次
+  async function ensureGitBin(force) {
+    if (force) {
+      state.gitBin = null
+      state.gitBinInit = false
+      state.gitPathSource = null
+    }
+    if (state.gitBinInit) return state.gitBin
+    if (gitBinInflight) return gitBinInflight
+    gitBinInflight = (async () => {
+      let p = await resolveExe('git')
+      let source = p ? 'path' : null
+      if (!p) {
+        const freshPath = await readFreshWindowsPath()
+        if (freshPath) {
+          p = await resolveExe('git', { PATH: freshPath })
+          if (p) source = 'registry'
+        }
+      }
+      if (!p) {
+        p = await probeKnownGitLocations()
+        if (p) source = 'known'
+      }
+      state.gitBin = p || null
+      state.gitBinInit = true
+      state.gitPathSource = source
+      return state.gitBin
+    })()
+    try {
+      return await gitBinInflight
+    } finally {
+      gitBinInflight = null
+    }
+  }
+
+  // 构造 git 命令 argv：有解析到绝对路径（git.exe / git）则用之，否则退回 PATH 里的 'git'
+  function gitArgv() {
+    const args = Array.prototype.slice.call(arguments)
+    return state.gitBin ? [state.gitBin].concat(args) : ['git'].concat(args)
+  }
+
+  // git 命令统一入口：先解析 git 绝对路径，再用其执行，保证一定能执行
+  async function runGit(args, opts = {}) {
+    await ensureGitBin()
+    return runArgv(gitArgv.apply(null, args), opts)
+  }
+
   async function detectGh(force) {
     const ghPath = await ensureGhBin(force)
     let version = null
@@ -390,16 +477,16 @@ export function apply(ctx) {
   }
 
   async function gitConfigGet(key) {
-    const r = await runArgv(['git', 'config', '--global', '--get', key], { timeoutMs: 15000 })
+    const r = await runGit(['config', '--global', '--get', key], { timeoutMs: 15000 })
     return r.exitCode === 0 ? (r.stdout || '').trim() : ''
   }
 
   async function gitConfigSet(key, value) {
     if (value === '') {
-      const r = await runArgv(['git', 'config', '--global', '--unset-all', key], { timeoutMs: 15000 })
+      const r = await runGit(['config', '--global', '--unset-all', key], { timeoutMs: 15000 })
       return { ok: r.exitCode === 0, message: r.exitCode === 0 ? '已清除' : (r.stderr || '').trim() }
     }
-    const r = await runArgv(['git', 'config', '--global', key, value], { timeoutMs: 15000 })
+    const r = await runGit(['config', '--global', key, value], { timeoutMs: 15000 })
     return { ok: r.exitCode === 0, message: r.exitCode === 0 ? '' : (r.stderr || '').trim() }
   }
 
@@ -407,14 +494,14 @@ export function apply(ctx) {
   async function repoCurrent(workdir) {
     const dir = workdir || (state.env ? state.env.home : null)
     if (!dir) return { ok: true, inRepo: false, workdir: null }
-    const inside = await runArgv(['git', 'rev-parse', '--is-inside-work-tree'], { cwd: dir, timeoutMs: 15000 })
+    const inside = await runGit(['rev-parse', '--is-inside-work-tree'], { cwd: dir, timeoutMs: 15000 })
     if (inside.exitCode !== 0) return { ok: true, inRepo: false, workdir: dir }
     const [branchR, statusR, remoteR, upstreamR, aheadR] = await Promise.all([
-      runArgv(['git', 'branch', '--show-current'], { cwd: dir, timeoutMs: 15000 }),
-      runArgv(['git', 'status', '--porcelain'], { cwd: dir, timeoutMs: 15000 }),
-      runArgv(['git', 'remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: 15000 }),
-      runArgv(['git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { cwd: dir, timeoutMs: 15000 }),
-      runArgv(['git', 'rev-list', '--left-right', '--count', '@{u}...HEAD'], { cwd: dir, timeoutMs: 15000 }),
+      runGit(['branch', '--show-current'], { cwd: dir, timeoutMs: 15000 }),
+      runGit(['status', '--porcelain'], { cwd: dir, timeoutMs: 15000 }),
+      runGit(['remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: 15000 }),
+      runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { cwd: dir, timeoutMs: 15000 }),
+      runGit(['rev-list', '--left-right', '--count', '@{u}...HEAD'], { cwd: dir, timeoutMs: 15000 }),
     ])
     const branch = (branchR.stdout || '').trim()
     const uncommitted = (statusR.stdout || '').split('\n').filter((s) => s.trim() !== '').length
@@ -540,9 +627,9 @@ export function apply(ctx) {
     if (!name) return { ok: false, error: '请输入仓库名' }
     await ensureEnv()
     const src = args.source || state.env.home || '.'
-    const init = await runArgv(['git', 'rev-parse', '--is-inside-work-tree'], { cwd: src, timeoutMs: 15000 })
+    const init = await runGit(['rev-parse', '--is-inside-work-tree'], { cwd: src, timeoutMs: 15000 })
     if (init.exitCode !== 0) {
-      const g = await runArgv(['git', 'init'], { cwd: src, timeoutMs: 15000 })
+      const g = await runGit(['init'], { cwd: src, timeoutMs: 15000 })
       if (g.exitCode !== 0) return { ok: false, error: '本地目录初始化 Git 失败：' + ((g.stderr || '').trim()) }
     }
     const vis = args.visibility === 'private' ? '--private' : '--public'
@@ -556,7 +643,7 @@ export function apply(ctx) {
   async function repoOpenRemote(workdir) {
     const dir = workdir || (state.env ? state.env.home : null)
     if (!dir) return { ok: false, error: '缺少工作目录' }
-    const r = await runArgv(['git', 'remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: 15000 })
+    const r = await runGit(['remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: 15000 })
     if (r.exitCode !== 0) return { ok: false, error: '当前仓库没有 origin 远程地址' }
     const url = toWebUrl((r.stdout || '').trim())
     if (!url) return { ok: false, error: '无法解析 remote URL' }
@@ -574,7 +661,7 @@ export function apply(ctx) {
   async function repoPush(workdir) {
     const dir = workdir || (state.env ? state.env.home : null)
     if (!dir) return { ok: false, error: '缺少工作目录' }
-    const r = await runArgv(['git', 'push'], { cwd: dir, timeoutMs: 120000, opId: 'push-' + (++state.opSeq) })
+    const r = await runGit(['push'], { cwd: dir, timeoutMs: 120000, opId: 'push-' + (++state.opSeq) })
     const msg = (r.stdout + '\n' + r.stderr).trim() || 'push 完成'
     return { ok: r.exitCode === 0, error: r.exitCode !== 0 ? msg : undefined, message: msg }
   }
@@ -582,7 +669,7 @@ export function apply(ctx) {
   async function repoPull(workdir) {
     const dir = workdir || (state.env ? state.env.home : null)
     if (!dir) return { ok: false, error: '缺少工作目录' }
-    const r = await runArgv(['git', 'pull'], { cwd: dir, timeoutMs: 120000, opId: 'pull-' + (++state.opSeq) })
+    const r = await runGit(['pull'], { cwd: dir, timeoutMs: 120000, opId: 'pull-' + (++state.opSeq) })
     const msg = (r.stdout + '\n' + r.stderr).trim() || 'pull 完成'
     return { ok: r.exitCode === 0, error: r.exitCode !== 0 ? msg : undefined, message: msg }
   }
@@ -678,8 +765,8 @@ export function apply(ctx) {
 
   async function netStatus() {
     await ensureEnv()
-    const httpR = await runArgv(['git', 'config', '--get', 'http.proxy'], { timeoutMs: 15000 })
-    const httpsR = await runArgv(['git', 'config', '--get', 'https.proxy'], { timeoutMs: 15000 })
+    const httpR = await runGit(['config', '--get', 'http.proxy'], { timeoutMs: 15000 })
+    const httpsR = await runGit(['config', '--get', 'https.proxy'], { timeoutMs: 15000 })
     let systemProxy = null
     if (state.env.platform === 'windows') {
       try {
@@ -711,8 +798,8 @@ export function apply(ctx) {
     const p = String(proxy || '').trim()
     if (!p) return { ok: false, error: '请输入代理地址，如 http://127.0.0.1:7897' }
     const args = gitConfigArgs(scope)
-    const a = await runArgv(['git', 'config'].concat(args, ['http.proxy', p]), { timeoutMs: 15000 })
-    const b = await runArgv(['git', 'config'].concat(args, ['https.proxy', p]), { timeoutMs: 15000 })
+    const a = await runGit(['config'].concat(args, ['http.proxy', p]), { timeoutMs: 15000 })
+    const b = await runGit(['config'].concat(args, ['https.proxy', p]), { timeoutMs: 15000 })
     if (a.exitCode !== 0 || b.exitCode !== 0) {
       return { ok: false, error: ((a.stderr || '') + (b.stderr || '')).trim() || '写入 git 代理配置失败' }
     }
@@ -731,14 +818,14 @@ export function apply(ctx) {
 
   async function netClearProxy(scope) {
     const args = gitConfigArgs(scope)
-    await runArgv(['git', 'config'].concat(args, ['--unset-all', 'http.proxy']), { timeoutMs: 15000 })
-    await runArgv(['git', 'config'].concat(args, ['--unset-all', 'https.proxy']), { timeoutMs: 15000 })
+    await runGit(['config'].concat(args, ['--unset-all', 'http.proxy']), { timeoutMs: 15000 })
+    await runGit(['config'].concat(args, ['--unset-all', 'https.proxy']), { timeoutMs: 15000 })
     return { ok: true, message: '已清除 git 代理配置（' + (scope === 'global' ? '全局' : '当前仓库') + '）。若网络受限，git 操作可能直连超时。' }
   }
 
   async function netTestProxy() {
     // 使用当前 git 配置（含代理）连通测试 GitHub
-    const r = await runArgv(['git', 'ls-remote', 'https://github.com/cli/cli.git', 'HEAD'], { timeoutMs: 45000 })
+    const r = await runGit(['ls-remote', 'https://github.com/cli/cli.git', 'HEAD'], { timeoutMs: 45000 })
     if (r.exitCode === 0) return { ok: true, message: '连接 GitHub 成功（当前 git 代理配置可用）' }
     const err = (r.stderr || '').trim() || '连接 GitHub 失败'
     const hint = /timed out|Connection timed|Failed to connect|Recv failure|Could not|无法连接|超时/i.test(err)
@@ -843,7 +930,8 @@ export function apply(ctx) {
           auth = a.ok ? { accounts: a.accounts, active: a.active } : { error: a.error }
         }
         const git = { name: await gitConfigGet('user.name'), email: await gitConfigGet('user.email') }
-        return { ok: true, installed: d.installed, version: d.version, path: d.path, pathSource: d.pathSource || null, manualPath: state.manualPath, ghHost, platform: env.platform, home: env.home, installers, auth, git }
+        await ensureGitBin() // 确保 git 绝对路径已解析（gitConfigGet 已触发，这里兜底）
+        return { ok: true, installed: d.installed, version: d.version, path: d.path, pathSource: d.pathSource || null, manualPath: state.manualPath, gitBin: state.gitBin, gitPathSource: state.gitPathSource || null, ghHost, platform: env.platform, home: env.home, installers, auth, git }
       } catch (e) {
         return { ok: false, error: String((e && e.message) || e) }
       }
@@ -1061,10 +1149,13 @@ export function apply(ctx) {
     promptSvc.section({ name: 'plugin:dsh-ghcli', order: 150, text: GHLI_GUIDANCE })
   }
 
-  // P0：apply 钩子触发 gh --version 预热检测（与旧动态版一致）
+  // P0：apply 钩子触发 gh --version 预热检测（与旧动态版一致），并预热 git 绝对路径解析
   Promise.resolve().then(async () => {
     try {
-      if (!missingSub()) await detectGh()
+      if (!missingSub()) {
+        await detectGh()
+        await ensureGitBin()
+      }
     } catch (e) {
       state.lastDetect = { installed: false, error: String((e && e.message) || e) }
     }

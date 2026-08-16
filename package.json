@@ -1,7 +1,7 @@
 {
   "name": "@sweven-tears/dsh-ghcli",
   "description": "GitHub CLI 管理插件：gh 安装检测/自愈（含 Windows 网络代理自愈）、多账户认证管理、Git 仓库高频操作，全部在 DSH 设置页（GitHub CLI）呈现。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "keywords": [
     "dsh",
     "deepseek-harness",
