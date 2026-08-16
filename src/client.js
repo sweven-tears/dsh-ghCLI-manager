@@ -264,8 +264,11 @@ return {
       const [gitName, setGitName] = React.useState('')
       const [gitEmail, setGitEmail] = React.useState('')
 
+      // 仅首次加载时从服务器填充一次；之后外部 status 刷新不得覆盖用户正在编辑的输入
+      const gitFilled = React.useRef(false)
       React.useEffect(() => {
-        if (st && st.git) {
+        if (!gitFilled.current && st && st.git) {
+          gitFilled.current = true
           setGitName(st.git.name || '')
           setGitEmail(st.git.email || '')
         }
@@ -337,7 +340,7 @@ return {
             h('input', { className: 'ghcli-input', placeholder: 'Git 邮箱', value: gitEmail, onChange: (e) => setGitEmail(e.target.value), disabled: !!p.busy }),
           ),
           h('div', { className: 'ghcli-row' },
-            h('button', { className: 'ghcli-btn primary', disabled: !!p.busy, onClick: async () => { const r = await p.call('gh.git.save', { name: gitName.trim(), email: gitEmail.trim() }); if (r && r.ok) p.refresh() } }, '保存'),
+            h('button', { className: 'ghcli-btn primary', disabled: !!p.busy, onClick: async () => { const r = await p.call('gh.git.save', { name: gitName.trim(), email: gitEmail.trim() }); if (r && r.ok) { setGitName(gitName.trim()); setGitEmail(gitEmail.trim()); gitFilled.current = true; p.refresh() } } }, '保存'),
           ),
         ),
       )
