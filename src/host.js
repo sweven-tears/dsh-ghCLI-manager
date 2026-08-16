@@ -564,6 +564,82 @@ return {
       }
     }
 
+    // ================= 网络代理（git 直连超时时的自愈：读系统代理并写入 git 配置） =================
+    function gitConfigArgs(scope) {
+      return scope === 'global' ? ['--global'] : ['--local']
+    }
+
+    async function netStatus() {
+      await ensureEnv()
+      const httpR = await runArgv(['git', 'config', '--get', 'http.proxy'], { timeoutMs: 15000 })
+      const httpsR = await runArgv(['git', 'config', '--get', 'https.proxy'], { timeoutMs: 15000 })
+      let systemProxy = null
+      if (state.env.platform === 'windows') {
+        try {
+          const en = await runArgv(['cmd', '/c', 'reg', 'query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyEnable'], { timeoutMs: 15000 })
+          const sv = await runArgv(['cmd', '/c', 'reg', 'query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'], { timeoutMs: 15000 })
+          let enabled = false
+          if (en.exitCode === 0) {
+            const em = /REG_DWORD\s+0x([0-9a-f]+)/i.exec(en.stdout || '')
+            if (em) enabled = parseInt(em[1], 16) !== 0
+          }
+          if (enabled && sv.exitCode === 0) {
+            const sm = /REG_SZ\s+(.+)$/m.exec(sv.stdout || '')
+            if (sm) systemProxy = sm[1].trim()
+          }
+        } catch (e) {
+          systemProxy = null
+        }
+      }
+      return {
+        ok: true,
+        platform: state.env.platform,
+        gitHttpProxy: httpR.exitCode === 0 ? (httpR.stdout || '').trim() : '',
+        gitHttpsProxy: httpsR.exitCode === 0 ? (httpsR.stdout || '').trim() : '',
+        systemProxy,
+      }
+    }
+
+    async function netSetProxy(proxy, scope) {
+      const p = String(proxy || '').trim()
+      if (!p) return { ok: false, error: '请输入代理地址，如 http://127.0.0.1:7897' }
+      const args = gitConfigArgs(scope)
+      const a = await runArgv(['git', 'config'].concat(args, ['http.proxy', p]), { timeoutMs: 15000 })
+      const b = await runArgv(['git', 'config'].concat(args, ['https.proxy', p]), { timeoutMs: 15000 })
+      if (a.exitCode !== 0 || b.exitCode !== 0) {
+        return { ok: false, error: ((a.stderr || '') + (b.stderr || '')).trim() || '写入 git 代理配置失败' }
+      }
+      return { ok: true, message: '已设置 git 代理（' + (scope === 'global' ? '全局' : '当前仓库') + '）：' + p }
+    }
+
+    async function netAutoProxy(scope) {
+      const s = await netStatus()
+      if (!s.systemProxy) {
+        return state.env.platform === 'windows'
+          ? { ok: false, error: '未检测到 Windows 系统代理（注册表 ProxyEnable/ProxyServer），请手动输入代理地址。' }
+          : { ok: false, error: '当前平台未内置系统代理检测，请手动输入代理地址（如 http://127.0.0.1:7897）。' }
+      }
+      return netSetProxy(s.systemProxy, scope)
+    }
+
+    async function netClearProxy(scope) {
+      const args = gitConfigArgs(scope)
+      await runArgv(['git', 'config'].concat(args, ['--unset-all', 'http.proxy']), { timeoutMs: 15000 })
+      await runArgv(['git', 'config'].concat(args, ['--unset-all', 'https.proxy']), { timeoutMs: 15000 })
+      return { ok: true, message: '已清除 git 代理配置（' + (scope === 'global' ? '全局' : '当前仓库') + '）。若网络受限，git 操作可能直连超时。' }
+    }
+
+    async function netTestProxy() {
+      // 使用当前 git 配置（含代理）连通测试 GitHub
+      const r = await runArgv(['git', 'ls-remote', 'https://github.com/cli/cli.git', 'HEAD'], { timeoutMs: 45000 })
+      if (r.exitCode === 0) return { ok: true, message: '连接 GitHub 成功（当前 git 代理配置可用）' }
+      const err = (r.stderr || '').trim() || '连接 GitHub 失败'
+      const hint = /timed out|Connection timed|Failed to connect|Recv failure|Could not|无法连接|超时/i.test(err)
+        ? '（直连超时/被中断，通常是网络受限，建议配置代理）'
+        : ''
+      return { ok: false, error: err + hint }
+    }
+
     // ================= routes（Client -> Host RPC） =================
     function missingSub() {
       return sub == null || timerSvc == null
@@ -613,6 +689,49 @@ return {
       try {
         const a = args || {}
         return await addToPath(String(a.dir || ''))
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    })
+
+    harness.handle('gh.net.status', async () => {
+      try {
+        return await netStatus()
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    })
+
+    harness.handle('gh.net.set', async (args) => {
+      try {
+        const a = args || {}
+        return await netSetProxy(String(a.proxy || ''), a.scope === 'global' ? 'global' : 'repo')
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    })
+
+    harness.handle('gh.net.auto', async (args) => {
+      try {
+        const a = args || {}
+        return await netAutoProxy(a.scope === 'global' ? 'global' : 'repo')
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    })
+
+    harness.handle('gh.net.clear', async (args) => {
+      try {
+        const a = args || {}
+        return await netClearProxy(a.scope === 'global' ? 'global' : 'repo')
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    })
+
+    harness.handle('gh.net.test', async () => {
+      try {
+        return await netTestProxy()
       } catch (e) {
         return { ok: false, error: String((e && e.message) || e) }
       }

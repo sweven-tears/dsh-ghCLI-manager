@@ -13,14 +13,14 @@ Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → 
 
 | Tab | 能力 | 底层命令 |
 | --- | --- | --- |
-| 📦 状态与安装 | gh 安装徽章（✅ 已安装 v2.x / ❌ 未安装）、重新检测、一键安装/更新、GH_HOST 展示、未安装引导 Banner（自动安装 / 手动指引）、**手动指定 gh 安装路径**、**一键加入 PATH** | `gh --version`、`gh config get host`、winget/brew/apt、`reg add HKCU\Environment\Path` / `~/.bashrc` |
+| 📦 状态与安装 | gh 安装徽章（✅ 已安装 v2.x / ❌ 未安装）、重新检测、一键安装/更新、GH_HOST 展示、未安装引导 Banner（自动安装 / 手动指引）、**手动指定 gh 安装路径**、**一键加入 PATH**、**网络代理自愈**（检测系统代理并写入 git 配置 / 测试连接） | `gh --version`、`gh config get host`、winget/brew/apt、`reg add HKCU\Environment\Path` / `~/.bashrc`、`git config http.proxy` |
 | 🔐 账户与 Git | 活跃账户头像+用户名、账户列表（切换/登出）、Token 粘贴登录（企业版 GH_HOST）、刷新 Token、Git 全局 user.name/user.email 读写 | `gh auth status`、`gh api user`、`gh auth login --with-token`、`gh auth switch --user`、`gh auth logout`、`gh auth refresh`、`git config --global` |
 | 📁 仓库管理 | 克隆（目标非空弹确认框、浅克隆）、当前工作区仓库分支/未提交数/upstream 差异、Push/Pull/Create PR/打开远程页面、远程仓库 Star/Fork/最后推送、Fork、创建仓库 | `gh repo clone`、`gh api repos/{owner}/{repo}`、`gh repo fork`、`gh repo create`、`git push/pull/status/remote`、`gh pr create` |
 
-## 2. 架构（对应 readme.txt 第 4 节模块清单）
+## 2. 架构（模块清单）
 
-动态插件把 readme 的目标文件结构映射到两份运行时源码（`code.host` / `code.client`），
-内部按同名模块组织：
+动态插件把目标功能映射到两份运行时源码（`code.host` / `code.client`），
+内部按同名模块组织（设计来源为开发初期的 readme.txt，该文件已归档移除）：
 
 | readme 文件 | 动态插件中的对应物 |
 | --- | --- |
@@ -32,7 +32,7 @@ Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → 
 | `src/client/index.tsx` + components | `src/client.js` → `GhSettings` / `StatusTab` / `AccountTab` / `RepoTab`，注册进 `settings.section` 插槽 |
 | `src/client/styles.css` | `src/client.js` → `styles.insert(...)`（使用 `--dsw-alias-*` 主题变量，自适应暗色） |
 
-## 3. 关键实现约束（readme 第 3 节落地情况）
+## 3. 关键实现约束（落地情况）
 
 - **依赖最小化**：不安装任何 npm 包（无 simple-git）。Git 操作优先 `gh` CLI，
   本地仓库操作（状态/分支/upstream 差异/Push/Pull）直接调用系统 `git` 作为 fallback。
@@ -65,10 +65,24 @@ Git 仓库高频操作，全部以 DSH **设置页**（侧边栏 → 设置 → 
 ## 5. Client ↔ Host RPC 一览（harness.handle / host.call）
 
 `gh.status` · `gh.install` · `gh.setPath`（手动指定 gh 路径） · `gh.addPath`（加入 PATH） ·
+`gh.net.status` · `gh.net.set` · `gh.net.auto`（自动使用系统代理） · `gh.net.clear` · `gh.net.test` ·
 `gh.auth.login` · `gh.auth.switch` · `gh.auth.logout` · `gh.auth.refresh` ·
 `gh.git.save` · `gh.repo.current` · `gh.repo.clone` · `gh.repo.status` ·
 `gh.repo.fork` · `gh.repo.create` · `gh.repo.open` · `gh.repo.push` ·
 `gh.repo.pull` · `gh.repo.pr` · `gh.op.cancel`
+
+## 6. 网络代理自愈（踩坑内建）
+
+**背景**：git（libcurl）不读取 Windows 系统代理（WinINET），在需要代理才能出网的
+环境中 `git push/clone` 会报「直连超时 / Connection was aborted」，而浏览器、curl
+等走系统代理的应用正常——表现为「git 连不上 GitHub，其他都正常」。
+
+**插件能力**（📦 状态与安装 → 网络与代理）：
+- 读取当前 git 代理配置（`git config http.proxy` / `https.proxy`）
+- 读取 Windows 系统代理（注册表 `HKCU\...\Internet Settings` 的 ProxyEnable / ProxyServer）
+- 「自动使用系统代理」：把检测到的系统代理一键写入 git 配置（可选当前仓库或全局）
+- 「测试连接」：`git ls-remote` 实测 GitHub 连通性，失败时给出「建议配置代理」提示
+- 「清除代理」：恢复直连
 
 ## 6. 手动安装 gh（完整指南）
 

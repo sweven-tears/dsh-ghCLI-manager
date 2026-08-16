@@ -55,6 +55,10 @@ return {
       'gh.repo.push': 'Push 中…',
       'gh.repo.pull': 'Pull 中…',
       'gh.repo.pr': '创建 PR 中…',
+      'gh.net.set': '设置代理中…',
+      'gh.net.auto': '应用系统代理中…',
+      'gh.net.clear': '清除代理中…',
+      'gh.net.test': '测试连接中…',
     }
 
     function GhSettings(props) {
@@ -163,6 +167,19 @@ return {
       const isWin = !!(st && st.platform === 'windows')
       const addPathLabel = isWin ? '添加到用户 PATH' : '写入 shell 启动文件'
 
+      const [net, setNet] = React.useState(null)
+      const [proxyInput, setProxyInput] = React.useState('')
+      const [proxyScope, setProxyScope] = React.useState('repo')
+      React.useEffect(() => {
+        let alive = true
+        host.call('gh.net.status', {}).then((res) => { if (alive && res && res.ok) setNet(res) }).catch(() => {})
+        return () => { alive = false }
+      }, [])
+      async function refreshNet() {
+        const r = await host.call('gh.net.status', {})
+        if (r && r.ok) setNet(r)
+      }
+
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
         !st ? h('div', { className: 'ghcli-card' }, h('div', { className: 'ghcli-hint' }, '正在检测 gh 环境…')) : null,
 
@@ -206,6 +223,26 @@ return {
             h('button', { className: 'ghcli-btn', disabled: !!p.busy || !manualPath.trim(), onClick: async () => { const r = await p.call('gh.addPath', { dir: manualPath.trim() }); if (r && r.ok) p.refresh() } }, addPathLabel),
           ),
           h('div', { className: 'ghcli-hint' }, 'gh 已安装但检测不到时（不在 PATH）：在此指定其安装目录即可立即使用；「' + addPathLabel + '」可把它加入环境变量 PATH（可选，重启 DSH / 新终端后全局生效）。'),
+        ) : null,
+
+        st ? h('div', { className: 'ghcli-card' },
+          h('div', { className: 'ghcli-label' }, '网络与代理（git push 直连超时自愈）'),
+          h('div', { className: 'ghcli-hint' }, '当前 git 代理：' + ((net && (net.gitHttpProxy || net.gitHttpsProxy)) ? (net.gitHttpProxy || net.gitHttpsProxy) : '未配置（直连，网络受限时 push/clone 会超时）')),
+          h('div', { className: 'ghcli-hint' }, '系统代理（WinINET）：' + ((net && net.systemProxy) ? net.systemProxy : '未检测到' + (isWin ? '' : '（仅 Windows 自动检测）'))),
+          h('div', { className: 'ghcli-row' },
+            h('input', { className: 'ghcli-input', placeholder: '如 http://127.0.0.1:7897', value: proxyInput, onChange: (e) => setProxyInput(e.target.value), disabled: !!p.busy }),
+            h('select', { className: 'ghcli-input', style: { flex: '0 0 auto', width: 130 }, value: proxyScope, onChange: (e) => setProxyScope(e.target.value) },
+              h('option', { value: 'repo' }, '当前仓库'),
+              h('option', { value: 'global' }, '全局'),
+            ),
+          ),
+          h('div', { className: 'ghcli-row' },
+            h('button', { className: 'ghcli-btn primary', disabled: !!p.busy || !proxyInput.trim(), onClick: async () => { const r = await p.call('gh.net.set', { proxy: proxyInput.trim(), scope: proxyScope }); if (r && r.ok) refreshNet() } }, '设置代理'),
+            h('button', { className: 'ghcli-btn', disabled: !!p.busy, onClick: async () => { const r = await p.call('gh.net.auto', { scope: proxyScope }); if (r && r.ok) { if (net && net.systemProxy) setProxyInput(net.systemProxy); refreshNet() } } }, '自动使用系统代理'),
+            h('button', { className: 'ghcli-btn', disabled: !!p.busy, onClick: async () => { await p.call('gh.net.test', {}) } }, '测试连接'),
+            h('button', { className: 'ghcli-btn', disabled: !!p.busy, onClick: async () => { const r = await p.call('gh.net.clear', { scope: proxyScope }); if (r && r.ok) refreshNet() } }, '清除代理'),
+          ),
+          h('div', { className: 'ghcli-hint' }, '踩坑提示：git 不读 Windows 系统代理，网络受限环境下 push 会「直连超时」；用「自动使用系统代理」把系统代理写入 git 配置即可，随后点「测试连接」验证。'),
         ) : null,
 
         st && st.git ? h('div', { className: 'ghcli-card' },
