@@ -243,6 +243,8 @@ window.__ModuleLoader__.load({
           st ? h('div', { className: 'ghcli-card' },
             h('div', { className: 'ghcli-label' }, 'gh 安装路径'),
             h('div', { className: 'ghcli-hint' }, '当前使用：' + (st.path ? st.path : '未找到（gh 不在 PATH，可手动指定下方路径）')),
+            (st.path && st.pathSource === 'registry') ? h('div', { className: 'ghcli-hint' }, '✓ 经注册表 PATH 检测到（无需重启 DSH）') : null,
+            (st.path && st.pathSource === 'known') ? h('div', { className: 'ghcli-hint' }, '✓ 经常见安装目录探测到（无需重启 DSH）') : null,
             h('div', { className: 'ghcli-hint' }, st.manualPath ? '手动指定：' + st.manualPath : '手动指定：未设置'),
             h('div', { className: 'ghcli-row' },
               h('input', { className: 'ghcli-input', placeholder: 'gh.exe 完整路径或所在目录，如 C:\\Program Files\\gh-cli\\bin', value: manualPath, onChange: (e) => setManualPath(e.target.value), disabled: !!p.busy }),

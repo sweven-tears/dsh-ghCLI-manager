@@ -33,6 +33,7 @@ export function apply(ctx) {
     lastDetect: null,
     ghBin: null,          // 解析到的 gh 可执行文件绝对路径；null 表示未找到
     ghBinInit: false,     // ghBin 是否已解析（三态避免重复探测）
+    pathSource: null,     // ghBin 来源：'path' | 'manual' | 'registry' | 'known' | null
     manualPath: null,     // 用户手动指定的 gh 路径（exe 或目录）
     activeOps: new Map(), // opId -> { terminate, label }
     opSeq: 0,
@@ -148,10 +149,15 @@ export function apply(ctx) {
     let platform = 'posix'
     if (await resolveExe('cmd')) platform = 'windows'
     let home = ''
+    let localAppData = ''
     try {
       if (platform === 'windows') {
-        const r = await runArgv(['cmd', '/c', 'echo', '%USERPROFILE%'], { timeoutMs: 15000 })
-        home = (r.stdout || '').trim()
+        const [u, l] = await Promise.all([
+          runArgv(['cmd', '/c', 'echo', '%USERPROFILE%'], { timeoutMs: 15000 }),
+          runArgv(['cmd', '/c', 'echo', '%LOCALAPPDATA%'], { timeoutMs: 15000 }),
+        ])
+        home = (u.stdout || '').trim()
+        localAppData = (l.stdout || '').trim()
       } else {
         const r = await runArgv(['sh', '-c', 'echo $HOME'], { timeoutMs: 15000 })
         home = (r.stdout || '').trim()
@@ -159,7 +165,7 @@ export function apply(ctx) {
     } catch (e) {
       // 保持空
     }
-    state.env = { platform, home }
+    state.env = { platform, home, localAppData }
     console.log(`gh env: platform=${platform} home=${home || '(unknown)'}`)
     return state.env
   }
@@ -181,12 +187,98 @@ export function apply(ctx) {
     return null
   }
 
-  async function ensureGhBin() {
+  // Windows：合并注册表中的用户与系统 PATH（新加的目录立即可见，无需重启宿主进程），
+  // 并展开 %VAR% 占位符；返回合并后的 PATH 字符串，失败返回 null。
+  // 用于解决「用户已添加环境变量，但 DSH 宿主进程启动更早、其 PATH 陈旧」的场景。
+  async function readFreshWindowsPath() {
+    await ensureEnv()
+    if (state.env.platform !== 'windows') return null
+    // 首选 PowerShell（Windows 10+ 自带）：一次读取机器 + 用户 PATH 并展开
+    const psCmd = "$m=[Environment]::GetEnvironmentVariable('Path','Machine');$u=[Environment]::GetEnvironmentVariable('Path','User');if($m -or $u){[Environment]::ExpandEnvironmentVariables(($m+';'+$u))}"
+    const ps = await runArgv(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', psCmd], { timeoutMs: 20000 })
+    if (ps.exitCode === 0 && (ps.stdout || '').trim()) return (ps.stdout || '').trim().replace(/\r?\n/g, '')
+    // 回退：reg query 读原始值 + 用进程环境展开 %VAR%
+    const parts = []
+    for (const hive of ['HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment', 'HKCU\\Environment']) {
+      const q = await runArgv(['cmd', '/c', 'reg', 'query', hive, '/v', 'Path'], { timeoutMs: 15000 })
+      if (q.exitCode === 0) {
+        const m = /REG_(?:EXPAND_)?SZ\s+(.+)$/m.exec(q.stdout || '')
+        if (m) parts.push(m[1].trim())
+      }
+    }
+    if (!parts.length) return null
+    const setR = await runArgv(['cmd', '/c', 'set'], { timeoutMs: 15000 })
+    const vars = {}
+    for (const line of (setR.stdout || '').split('\n')) {
+      const i = line.indexOf('=')
+      if (i > 0) vars[line.slice(0, i)] = line.slice(i + 1).trim()
+    }
+    return parts.join(';').replace(/%([^%]+)%/g, (m, k) => (vars[k] != null ? vars[k] : m))
+  }
+
+  // 常见 gh 安装目录探测（PATH 与注册表都失败时的最后兜底）
+  async function probeKnownGhLocations() {
+    await ensureEnv()
+    const env = state.env
+    const locs = []
+    if (env.platform === 'windows') {
+      if (env.localAppData) {
+        locs.push(
+          joinPath(env.localAppData, 'Programs', 'gh-cli', 'bin', 'gh.exe'),
+          joinPath(env.localAppData, 'Programs', 'GitHub CLI', 'gh.exe'),
+          joinPath(env.localAppData, 'GitHubDesktop', 'bin', 'gh.exe'),
+        )
+      }
+      if (env.home) locs.push(joinPath(env.home, 'scoop', 'shims', 'gh.exe'))
+      locs.push(
+        joinPath('C:', 'Program Files', 'GitHub CLI', 'gh.exe'),
+        joinPath('C:', 'Program Files (x86)', 'GitHub CLI', 'gh.exe'),
+        joinPath('C:', 'Program Files', 'GitHub Desktop', 'bin', 'gh.exe'),
+      )
+    } else {
+      locs.push('/usr/local/bin/gh', '/opt/homebrew/bin/gh', '/usr/bin/gh', '/snap/bin/gh')
+      if (env.home) locs.push(joinPath(env.home, '.local', 'bin', 'gh'))
+    }
+    for (const loc of locs) {
+      if (!loc) continue
+      const r = await resolveExe(loc)
+      if (r) return r
+    }
+    return null
+  }
+
+  // gh 可执行文件解析（三级兜底）：
+  //   1) 进程 PATH（DSH 重启后用户新加的环境变量天然可见）
+  //   2) 注册表里的用户 + 系统 PATH（Windows 专用，无需重启 DSH，读取后展开 %VAR%）
+  //   3) 常见安装目录探测（winget / 便携版 / GitHub Desktop / scoop 等）
+  async function ensureGhBin(force) {
+    if (force) {
+      state.ghBin = null
+      state.ghBinInit = false
+      state.pathSource = null
+      state.lastDetect = null
+    }
     if (state.ghBinInit) return state.ghBin
     let p = await resolveExe('gh')
-    if (!p && state.manualPath) p = await resolveGhPath(state.manualPath)
+    let source = p ? 'path' : null
+    if (!p && state.manualPath) {
+      p = await resolveGhPath(state.manualPath)
+      if (p) source = 'manual'
+    }
+    if (!p) {
+      const freshPath = await readFreshWindowsPath()
+      if (freshPath) {
+        p = await resolveExe('gh', { PATH: freshPath })
+        if (p) source = 'registry'
+      }
+    }
+    if (!p) {
+      p = await probeKnownGhLocations()
+      if (p) source = 'known'
+    }
     state.ghBin = p || null
     state.ghBinInit = true
+    state.pathSource = source
     return state.ghBin
   }
 
@@ -196,8 +288,8 @@ export function apply(ctx) {
     return state.ghBin ? [state.ghBin].concat(args) : ['gh'].concat(args)
   }
 
-  async function detectGh() {
-    const ghPath = await ensureGhBin()
+  async function detectGh(force) {
+    const ghPath = await ensureGhBin(force)
     let version = null
     let installed = false
     if (ghPath) {
@@ -208,7 +300,7 @@ export function apply(ctx) {
         version = m ? m[1] : (r.stdout || '').split('\n')[0]
       }
     }
-    const d = { installed, path: ghPath, version }
+    const d = { installed, path: ghPath, version, pathSource: state.pathSource || null }
     state.lastDetect = d
     return d
   }
@@ -230,7 +322,7 @@ export function apply(ctx) {
     else if (installer === 'brew') argv = ['brew', 'install', 'gh']
     else argv = ['sudo', 'apt-get', 'install', '-y', 'gh']
     const r = await runArgv(argv, { timeoutMs: 300000, opId: opId || 'install-' + (++state.opSeq) })
-    const d = await detectGh()
+    const d = await detectGh(true) // 强制重检：winget 装完立即可识别，无需重启 DSH
     const ok = r.exitCode === 0 || d.installed
     return { ok, exitCode: r.exitCode, installer, installed: d.installed, version: d.version, message: (r.stdout + '\n' + r.stderr).trim() || (ok ? '安装完成' : '安装失败') }
   }
@@ -738,7 +830,7 @@ export function apply(ctx) {
       try {
         if (missingSub()) return { ok: false, error: 'subprocess/timer 服务不可用' }
         const env = await ensureEnv()
-        const d = await detectGh()
+        const d = await detectGh(true) // 强制重检：用户安装/加 PATH 后「重新检测」立即可见
         const installers = await detectInstallers()
         let ghHost = null
         if (d.installed) {
@@ -751,7 +843,7 @@ export function apply(ctx) {
           auth = a.ok ? { accounts: a.accounts, active: a.active } : { error: a.error }
         }
         const git = { name: await gitConfigGet('user.name'), email: await gitConfigGet('user.email') }
-        return { ok: true, installed: d.installed, version: d.version, path: d.path, manualPath: state.manualPath, ghHost, platform: env.platform, home: env.home, installers, auth, git }
+        return { ok: true, installed: d.installed, version: d.version, path: d.path, pathSource: d.pathSource || null, manualPath: state.manualPath, ghHost, platform: env.platform, home: env.home, installers, auth, git }
       } catch (e) {
         return { ok: false, error: String((e && e.message) || e) }
       }
