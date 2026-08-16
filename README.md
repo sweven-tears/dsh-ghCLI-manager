@@ -29,6 +29,18 @@ dsh plugin --profile web add D:\Program\harness\plugins\dsh-ghCLI -w
 - 卸载：`dsh plugin --profile web remove dsh-ghcli`。本地 file: 依赖通常为
   符号链接，改 `src/` 后重启 dsh web 即生效。
 
+### 0.1 从 GitHub Packages 安装（npm 包形态，`@sweven-tears/dsh-ghcli`）
+
+本插件已发布到 GitHub Packages：<https://github.com/users/sweven-tears/packages/npm/dsh-ghcli>。
+消费方需先配置作用域映射与认证（仓库已内置 `.npmrc` 作用域映射，无需手写 registry）：
+
+```powershell
+# 一次性认证：用户名 = GitHub 用户名，密码 = 带 read:packages 权限的 PAT
+npm login --registry=https://npm.pkg.github.com/ --scope=@sweven-tears
+# 安装到 web profile（需重启 dsh web 生效）
+dsh plugin --profile web add @sweven-tears/dsh-ghcli -w
+```
+
 ---
 
 ## 1. 功能总览
